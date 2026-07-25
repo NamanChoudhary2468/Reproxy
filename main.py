@@ -114,6 +114,11 @@ async def reproxy(token: str, request: Request):
     if custom_cookies:
         headers["cookie"] = "; ".join(f"{k}={v}" for k, v in custom_cookies.items())
 
+    # Force uncompressed responses so the upstream Content-Length stays
+    # accurate end-to-end (httpx auto-decompresses gzip/br/deflate,
+    # which would otherwise make a forwarded Content-Length wrong).
+    headers["accept-encoding"] = "identity"
+
     body = await request.body()
 
     client_kwargs = {"timeout": TIMEOUT, "follow_redirects": True}
@@ -133,20 +138,26 @@ async def reproxy(token: str, request: Request):
     out_headers = dict(resp.headers)
     out_headers["access-control-allow-origin"] = "*"
     out_headers["access-control-expose-headers"] = "*"
-    # content-length/transfer-encoding will be recomputed by the server
-    out_headers.pop("content-length", None)
+    # transfer-encoding is a hop-by-hop header; content-encoding should be
+    # gone anyway since we requested identity. content-length we KEEP —
+    # with identity encoding it now accurately reflects the streamed body.
     out_headers.pop("transfer-encoding", None)
     out_headers.pop("content-encoding", None)
 
-    try:
-        raw_name = unquote(urlsplit(target).path.rsplit("/", 1)[-1])
-        if raw_name:
-            safe_name = raw_name.replace('"', "")
-            out_headers["content-disposition"] = (
-                f'attachment; filename="{safe_name}"; filename*=UTF-8\'\'{quote(raw_name)}'
-            )
-    except Exception:
-        pass
+    # Prefer the upstream's own Content-Disposition filename (e.g. file
+    # hosts that serve everything from a generic /serve?t=... path with
+    # the real name only present in this header). Fall back to the URL
+    # path only if upstream didn't supply one.
+    if "content-disposition" not in {k.lower() for k in out_headers}:
+        try:
+            raw_name = unquote(urlsplit(target).path.rsplit("/", 1)[-1])
+            if raw_name:
+                safe_name = raw_name.replace('"', "")
+                out_headers["content-disposition"] = (
+                    f'attachment; filename="{safe_name}"; filename*=UTF-8\'\'{quote(raw_name)}'
+                )
+        except Exception:
+            pass
 
     async def body_stream():
         try:
