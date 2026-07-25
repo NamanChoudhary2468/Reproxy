@@ -126,13 +126,20 @@ async def reproxy(token: str, request: Request):
         proxy_url = proxy_spec if "://" in proxy_spec else f"http://{proxy_spec}"
         client_kwargs["proxy"] = proxy_url
 
+    # NOTE: deliberately not using `async with` here — that would close
+    # the client (and its connection) as soon as this block exits, which
+    # is *before* StreamingResponse actually drains the body below.
+    # Result looked like "slow transfer" but was really a dead
+    # connection after headers. Client is closed explicitly once
+    # body_stream() finishes (or errors) instead.
+    client = httpx.AsyncClient(**client_kwargs)
     try:
-        async with httpx.AsyncClient(**client_kwargs) as client:
-            upstream = client.build_request(
-                request.method, target, headers=headers, content=body if body else None
-            )
-            resp = await client.send(upstream, stream=True)
+        upstream = client.build_request(
+            request.method, target, headers=headers, content=body if body else None
+        )
+        resp = await client.send(upstream, stream=True)
     except httpx.HTTPError as exc:
+        await client.aclose()
         return JSONResponse({"error": f"Upstream fetch failed: {exc}"}, status_code=502)
 
     out_headers = dict(resp.headers)
@@ -165,6 +172,7 @@ async def reproxy(token: str, request: Request):
                 yield chunk
         finally:
             await resp.aclose()
+            await client.aclose()
 
     return StreamingResponse(
         body_stream(),
