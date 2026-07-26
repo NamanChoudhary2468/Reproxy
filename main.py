@@ -1,5 +1,8 @@
+import asyncio
 import base64
 import json
+import os
+from contextlib import asynccontextmanager
 from urllib.parse import quote, unquote, urlsplit
 
 from curl_cffi.requests import AsyncSession
@@ -7,7 +10,26 @@ from curl_cffi import requests as curl_requests
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-app = FastAPI()
+TIMEOUT = 15.0
+# Caps how many upstream transfers can be in flight at once. Video
+# players open several parallel Range requests when seeking — on a
+# small instance, too many concurrent streams is what was causing OOM,
+# not any single request. Tune via env var to match instance RAM.
+MAX_CONCURRENT_STREAMS = int(os.environ.get("MAX_CONCURRENT_STREAMS", "12"))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # One shared session/connection pool for the app's lifetime instead
+    # of spinning up a fresh curl multi-handle per request — cheaper per
+    # request and avoids piling up unclosed handles under load.
+    app.state.session = AsyncSession(timeout=TIMEOUT)
+    app.state.stream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_STREAMS)
+    yield
+    await app.state.session.close()
+
+
+app = FastAPI(lifespan=lifespan)
 
 # Headers forwarded from the incoming client request to the target,
 # same set as the original Workers script.
@@ -25,8 +47,6 @@ FORWARD_HEADERS = [
     "referer",
     "origin",
 ]
-
-TIMEOUT = 15.0
 
 
 def encode_base64url(data: str) -> str:
@@ -122,16 +142,16 @@ async def reproxy(token: str, request: Request):
 
     body = await request.body()
 
-    session_kwargs = {"timeout": TIMEOUT}
     proxy_url = None
     if proxy_spec:
         proxy_url = proxy_spec if "://" in proxy_spec else f"http://{proxy_spec}"
 
-    # NOTE: session stays open until body_stream() finishes draining —
-    # closing it right after headers arrive (e.g. via `async with`)
-    # kills the connection before the body is actually read, which looks
-    # like a dead-slow transfer even though headers came back fine.
-    session = AsyncSession(**session_kwargs)
+    session = request.app.state.session
+    semaphore = request.app.state.stream_semaphore
+
+    # Bound how many transfers run at once (protects small instances from
+    # OOM when a video player opens many parallel Range requests).
+    acquired = await semaphore.acquire()
     try:
         resp = await session.request(
             request.method,
@@ -144,8 +164,11 @@ async def reproxy(token: str, request: Request):
             stream=True,
         )
     except curl_requests.errors.RequestsError as exc:
-        await session.close()
+        semaphore.release()
         return JSONResponse({"error": f"Upstream fetch failed: {exc}"}, status_code=502)
+    except Exception:
+        semaphore.release()
+        raise
 
     out_headers = dict(resp.headers)
     out_headers["access-control-allow-origin"] = "*"
@@ -174,8 +197,7 @@ async def reproxy(token: str, request: Request):
                 yield chunk
         finally:
             await resp.aclose()
-            await session.close()
-            await client.aclose()
+            semaphore.release()
 
     return StreamingResponse(
         body_stream(),
