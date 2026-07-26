@@ -15,7 +15,7 @@ TIMEOUT = 15.0
 # players open several parallel Range requests when seeking — on a
 # small instance, too many concurrent streams is what was causing OOM,
 # not any single request. Tune via env var to match instance RAM.
-MAX_CONCURRENT_STREAMS = int(os.environ.get("MAX_CONCURRENT_STREAMS", "15"))
+MAX_CONCURRENT_STREAMS = int(os.environ.get("MAX_CONCURRENT_STREAMS", "30"))
 
 
 @asynccontextmanager
