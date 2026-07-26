@@ -10,12 +10,12 @@ from curl_cffi import requests as curl_requests
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-TIMEOUT = 15.0
+TIMEOUT = 30.0
 # Caps how many upstream transfers can be in flight at once. Video
 # players open several parallel Range requests when seeking — on a
 # small instance, too many concurrent streams is what was causing OOM,
 # not any single request. Tune via env var to match instance RAM.
-MAX_CONCURRENT_STREAMS = int(os.environ.get("MAX_CONCURRENT_STREAMS", "12"))
+MAX_CONCURRENT_STREAMS = int(os.environ.get("MAX_CONCURRENT_STREAMS", "3"))
 
 
 @asynccontextmanager
