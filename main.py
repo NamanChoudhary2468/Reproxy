@@ -10,23 +10,24 @@ from curl_cffi import requests as curl_requests
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-TIMEOUT = 30.0
+TIMEOUT = 15.0
 # Caps how many upstream transfers can be in flight at once. Video
 # players open several parallel Range requests when seeking — on a
 # small instance, too many concurrent streams is what was causing OOM,
 # not any single request. Tune via env var to match instance RAM.
-MAX_CONCURRENT_STREAMS = int(os.environ.get("MAX_CONCURRENT_STREAMS", "3"))
+MAX_CONCURRENT_STREAMS = int(os.environ.get("MAX_CONCURRENT_STREAMS", "12"))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # One shared session/connection pool for the app's lifetime instead
-    # of spinning up a fresh curl multi-handle per request — cheaper per
-    # request and avoids piling up unclosed handles under load.
-    app.state.session = AsyncSession(timeout=TIMEOUT)
+    # NOTE: session is intentionally NOT shared across requests — a
+    # single AsyncSession hit by concurrent requests caused
+    # "CURLM_ADDED_ALREADY" (multi error 7) and connection resets under
+    # real concurrent load (video players opening several parallel
+    # Range requests). Each request gets its own session; only the
+    # semaphore below is shared, to cap total concurrency for memory.
     app.state.stream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_STREAMS)
     yield
-    await app.state.session.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -146,12 +147,12 @@ async def reproxy(token: str, request: Request):
     if proxy_spec:
         proxy_url = proxy_spec if "://" in proxy_spec else f"http://{proxy_spec}"
 
-    session = request.app.state.session
+    session = AsyncSession(timeout=TIMEOUT)
     semaphore = request.app.state.stream_semaphore
 
     # Bound how many transfers run at once (protects small instances from
     # OOM when a video player opens many parallel Range requests).
-    acquired = await semaphore.acquire()
+    await semaphore.acquire()
     try:
         resp = await session.request(
             request.method,
@@ -165,9 +166,11 @@ async def reproxy(token: str, request: Request):
         )
     except curl_requests.errors.RequestsError as exc:
         semaphore.release()
+        await session.close()
         return JSONResponse({"error": f"Upstream fetch failed: {exc}"}, status_code=502)
     except Exception:
         semaphore.release()
+        await session.close()
         raise
 
     out_headers = dict(resp.headers)
@@ -197,6 +200,7 @@ async def reproxy(token: str, request: Request):
                 yield chunk
         finally:
             await resp.aclose()
+            await session.close()
             semaphore.release()
 
     return StreamingResponse(
